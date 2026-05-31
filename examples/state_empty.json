@@ -1,5 +1,5 @@
 {
-  "_说明": "未建仓示例：开盘后无持仓可卖，sellable/locked 为空。传给 predict.py --state 或 workbench.py predict-next --state-in。默认按下一交易日 open 撮合；若该日缺 CSV 且请求 open，则显式采用前一可用交易日 close 近似。",
+  "_说明": "未建仓示例：开盘后无持仓可卖，sellable/locked 为空。传给 workbench execute-next --state-in；predict-next 仅用于记录 input_position_mode。",
   "position_status": "empty",
   "cash": 1000000.0,
   "lot_size": 100,

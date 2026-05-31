@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import argparse
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -427,6 +427,26 @@ def score_weighted_buys_for_cash_budget(
         tgt = floor_to_lot(int(nav_mid * wt[code] / tpx[code]), lot_size)
         if tgt > 0:
             desired[code] = tgt
+
+    # 为了提升建仓分散度：先尝试给每只目标股分配 1 手（按分数从高到低），
+    # 再叠加按分数加权的额外仓位。这样在现金充足时更容易接近 Top-k 持仓只数。
+    ranked_codes = sorted(tradable, key=lambda c: (-scores_map.get(c, -np.inf), c))
+    min_lot_alloc: Dict[str, int] = {}
+    base_remaining = budget_cash
+    for code in ranked_codes:
+        px = tpx[code]
+        one_lot = lot_size
+        gross = one_lot * px
+        fee = fees_on_buy_turnover(code, gross, one_lot, commission_rate)
+        if gross + fee <= base_remaining + 1e-6:
+            min_lot_alloc[code] = one_lot
+            base_remaining -= gross + fee
+        else:
+            break
+
+    for code, sh in min_lot_alloc.items():
+        desired[code] = max(desired.get(code, 0), sh)
+
     desired = _trim_desired_cost_to_budget(desired, tpx, lot_size, nav_mid, scores_map)
     tmp_locked: Dict[str, int] = {}
     spent = 0.0
@@ -540,6 +560,341 @@ def score_weights_from_picks_df(picks_df: pd.DataFrame) -> Dict[str, float]:
     return {c: float(w) for c, w in zip(codes, raw / tot)}
 
 
+def pick_target_picks_df(day_idx: pd.DataFrame, n: int, k: int | None = None) -> pd.DataFrame:
+    """目标持仓：截面 pred_score 最高的 n 只（k 仅用于日度换仓，不参与选股池截断）。"""
+    del k  # 保留参数以兼容 CLI；选股数量仅由 n 决定
+    sorted_df = day_idx.sort_values("pred_score", ascending=False).reset_index(drop=True)
+    return sorted_df.head(min(n, len(sorted_df))).copy()
+
+
+def portfolio_has_holdings(sellable: Dict[str, int], locked: Dict[str, int]) -> bool:
+    tot = sum(int(v) for v in sellable.values() if int(v) > 0) + sum(
+        int(v) for v in locked.values() if int(v) > 0
+    )
+    return tot > 0
+
+
+def _held_code_set(sellable: Dict[str, int], locked: Dict[str, int]) -> Set[str]:
+    codes = set(sellable) | set(locked)
+    return {c for c in codes if sellable.get(c, 0) + locked.get(c, 0) > 0}
+
+
+def daily_rotation_trades(
+    px_map: Dict[str, float],
+    picks_df: pd.DataFrame,
+    scores_map: Dict[str, float],
+    sellable: Dict[str, int],
+    locked: Dict[str, int],
+    cash: float,
+    lot_size: int,
+    commission_rate: float,
+    n: int,
+    k: int,
+) -> Tuple[Dict[str, int], Dict[str, int], float, float, float, List[Dict[str, Any]]]:
+    """
+    组合调仓：
+    - 目标持仓为 Top-n（picks_df）；
+    - 空仓：一次性按分数加权买入 n 只（忽略 k）；
+    - 有仓：
+      1) 强制卖出已跌出 Top-n 的持仓（整手可卖部分）；
+      2) 在剩余持仓中卖出分数最低的 k 只（rotate）；
+      3) 从 Top-n 未持有标的中按分数从高到低买入，只数 = min(本轮卖出只数, n-当前持仓只数)，
+         分数加权分配现金；买入只数不超过实际 rotate/trim 成功卖出只数，避免持仓膨胀。
+    """
+    sellable = dict(sellable)
+    locked = dict(locked)
+    cash = float(cash)
+    order_rows: List[Dict[str, Any]] = []
+    turnover_sell = 0.0
+    turnover_buy = 0.0
+
+    _unlock_morning(sellable, locked)
+
+    def _log(side: str, code: str, shares: int, px: float, phase: str) -> None:
+        if shares <= 0:
+            return
+        order_rows.append(
+            {
+                "side": side,
+                "ts_code": code,
+                "shares": int(shares),
+                "price": float(px),
+                "amount": float(shares * px),
+                "phase": phase,
+            }
+        )
+
+    def _try_sell(code: str, phase: str) -> bool:
+        nonlocal cash, turnover_sell
+        sh0 = sellable.get(code, 0)
+        qty = floor_to_lot(sh0, lot_size)
+        if qty <= 0:
+            return False
+        px = float(px_map.get(code, float("nan")))
+        if not np.isfinite(px) or px <= 0:
+            return False
+        proceeds = qty * px
+        sf = fees_on_sell_turnover(code, proceeds, qty, commission_rate)
+        sellable[code] = sh0 - qty
+        if sellable[code] <= 0:
+            sellable.pop(code, None)
+        cash += proceeds - sf
+        turnover_sell += proceeds
+        _log("卖出", code, qty, px, phase)
+        return True
+
+    if picks_df.empty:
+        return sellable, locked, cash, turnover_sell, turnover_buy, order_rows
+
+    target_codes = [str(c) for c in picks_df["ts_code"].astype(str).tolist()]
+    target_set = set(target_codes)
+
+    if not portfolio_has_holdings(sellable, locked):
+        buy_px = {
+            c: float(px_map[c])
+            for c in target_codes
+            if np.isfinite(px_map.get(c, np.nan)) and float(px_map[c]) > 0
+        }
+        tradable_df = picks_df[picks_df["ts_code"].astype(str).isin(buy_px.keys())].copy()
+        tmp_locked, spent, _bf = score_weighted_buys_for_cash_budget(
+            buy_px, cash, tradable_df, scores_map, lot_size, commission_rate
+        )
+        for code, sh in tmp_locked.items():
+            px = buy_px[code]
+            _log("买入", code, sh, px, "initial-按Top-n分数加权建仓")
+            turnover_buy += sh * px
+        cash = cash - spent - _bf
+        locked.update(tmp_locked)
+        return sellable, locked, cash, turnover_sell, turnover_buy, order_rows
+
+    # 1) 跌出 Top-n：强制清仓（按整手）
+    trim_sold = 0
+    for code in sorted(_held_code_set(sellable, locked)):
+        if code not in target_set and _try_sell(code, "trim-跌出Top-n"):
+            trim_sold += 1
+
+    # 2) rotate：卖出剩余持仓中分数最低的 k 只
+    rotate_sold = 0
+    held_in_pool = sorted(
+        _held_code_set(sellable, locked),
+        key=lambda c: (scores_map.get(c, -np.inf), c),
+    )
+    for code in held_in_pool:
+        if rotate_sold >= max(0, int(k)):
+            break
+        if _try_sell(code, "rotate-卖出持仓低分"):
+            rotate_sold += 1
+
+    # 3) 买入：填补至 Top-n，只数不超过本轮成功卖出只数
+    held_after = _held_code_set(sellable, locked)
+    slots_to_n = max(0, int(n) - len(held_after))
+    sell_slots = trim_sold + rotate_sold
+    buy_names = min(slots_to_n, sell_slots, len(target_codes))
+    buy_pool = [
+        c
+        for c in sorted(
+            target_codes,
+            key=lambda c: (-scores_map.get(c, -np.inf), c),
+        )
+        if c not in held_after
+    ]
+    buy_codes = buy_pool[:buy_names]
+
+    if buy_codes and cash > 1e-9:
+        picks_buy_df = picks_df[picks_df["ts_code"].astype(str).isin(set(buy_codes))].copy()
+        buy_px = {
+            c: float(px_map[c])
+            for c in buy_codes
+            if np.isfinite(px_map.get(c, np.nan)) and float(px_map[c]) > 0
+        }
+        picks_buy_df = picks_buy_df[picks_buy_df["ts_code"].astype(str).isin(buy_px.keys())]
+        tmp_locked, spent, buy_fees = score_weighted_buys_for_cash_budget(
+            buy_px, cash, picks_buy_df, scores_map, lot_size, commission_rate
+        )
+        for code, sh in tmp_locked.items():
+            _log("买入", code, sh, buy_px[code], "rotate-买入Top-n高分")
+            turnover_buy += sh * buy_px[code]
+        cash = cash - spent - buy_fees
+        locked.update(tmp_locked)
+
+    return sellable, locked, cash, turnover_sell, turnover_buy, order_rows
+
+
+def target_weights_from_panel(day_idx: pd.DataFrame, n: int, k: int | None = None) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    """由打分截面得到 Top-n 目标持仓及权重（k 不参与权重规划）。"""
+    picks_df = pick_target_picks_df(day_idx, n, k)
+    return picks_df, score_weights_from_picks_df(picks_df)
+
+
+def filter_target_weights_tradable(
+    target_weights: Dict[str, float],
+    px_map: Dict[str, float],
+) -> Dict[str, float]:
+    """仅保留当日有有效成交价的标的，并在子集内重新归一化权重。"""
+    kept = {
+        str(c): float(w)
+        for c, w in target_weights.items()
+        if np.isfinite(px_map.get(str(c), np.nan)) and float(px_map[str(c)]) > 0
+    }
+    tot = sum(kept.values())
+    if tot <= 1e-18:
+        return {}
+    return {c: w / tot for c, w in kept.items()}
+
+
+def desired_shares_from_target_weights(
+    nav: float,
+    target_weights: Dict[str, float],
+    px_map: Dict[str, float],
+    lot_size: int,
+    scores_map: Dict[str, float],
+) -> Dict[str, int]:
+    """按目标权重与 NAV、成交价计算理想整手股数（不含费用约束）。"""
+    if nav <= 1e-9 or not target_weights:
+        return {}
+    desired: Dict[str, int] = {}
+    for code, w in target_weights.items():
+        px = float(px_map.get(code, float("nan")))
+        if not np.isfinite(px) or px <= 0:
+            continue
+        tgt = floor_to_lot(int(nav * w / px), lot_size)
+        if tgt > 0:
+            desired[code] = tgt
+    return _trim_desired_cost_to_budget(desired, px_map, lot_size, nav, scores_map)
+
+
+def _portfolio_mv_at_px(
+    px_map: Dict[str, float],
+    sellable: Dict[str, int],
+    locked: Dict[str, int],
+) -> float:
+    mv = 0.0
+    for c, sh in {**sellable, **locked}.items():
+        if sh <= 0:
+            continue
+        px = float(px_map.get(c, float("nan")))
+        if np.isfinite(px):
+            mv += sh * px
+    return mv
+
+
+def _total_shares_dict(sellable: Dict[str, int], locked: Dict[str, int], code: str) -> int:
+    return int(sellable.get(code, 0)) + int(locked.get(code, 0))
+
+
+def rebalance_to_target_weights(
+    px_map: Dict[str, float],
+    target_weights: Dict[str, float],
+    sellable: Dict[str, int],
+    locked: Dict[str, int],
+    cash: float,
+    lot_size: int,
+    commission_rate: float,
+    scores_map: Dict[str, float],
+) -> Tuple[Dict[str, int], Dict[str, int], float, float, float, List[Dict[str, Any]]]:
+    """
+    两阶段调仓（与实盘一致）：
+    1) 目标权重仅由分数决定（调用方在 T-1 / 盘后给出）；
+    2) 本函数在 T 日开盘价 px_map 下，按 NAV×权重 换算整手股数并撮合。
+
+    返回 (sellable, locked, cash, turnover_sell, turnover_buy, order_rows)。
+    """
+    sellable = dict(sellable)
+    locked = dict(locked)
+    cash = float(cash)
+    order_rows: List[Dict[str, Any]] = []
+    turnover_sell = 0.0
+    turnover_buy = 0.0
+
+    _unlock_morning(sellable, locked)
+
+    tw = filter_target_weights_tradable(target_weights, px_map)
+    if not tw:
+        return sellable, locked, cash, turnover_sell, turnover_buy, order_rows
+
+    target_set = set(tw.keys())
+
+    def _append_order(side: str, code: str, shares: int, px: float, phase: str) -> None:
+        if shares <= 0:
+            return
+        order_rows.append(
+            {
+                "side": side,
+                "ts_code": code,
+                "shares": int(shares),
+                "price": float(px),
+                "amount": float(shares * px),
+                "phase": phase,
+            }
+        )
+
+    # 1) 清掉不在目标池内的可卖持仓
+    for code in sorted(list(sellable.keys())):
+        if code in target_set:
+            continue
+        sh0 = sellable.get(code, 0)
+        qty = floor_to_lot(sh0, lot_size)
+        if qty <= 0:
+            continue
+        px = float(px_map.get(code, float("nan")))
+        if not np.isfinite(px):
+            continue
+        proceeds = qty * px
+        sf = fees_on_sell_turnover(code, proceeds, qty, commission_rate)
+        sellable[code] = sh0 - qty
+        if sellable[code] <= 0:
+            sellable.pop(code, None)
+        cash += proceeds - sf
+        turnover_sell += proceeds
+        _append_order("卖出", code, qty, px, "rebalance-清出非目标")
+
+    nav = cash + _portfolio_mv_at_px(px_map, sellable, locked)
+    desired = desired_shares_from_target_weights(nav, tw, px_map, lot_size, scores_map)
+
+    # 2) 目标池内减配（仅可卖部分）
+    for code in sorted(desired.keys()):
+        cur = _total_shares_dict(sellable, locked, code)
+        tgt = desired[code]
+        if cur <= tgt:
+            continue
+        can_sell = sellable.get(code, 0)
+        qty = floor_to_lot(min(cur - tgt, can_sell), lot_size)
+        if qty <= 0:
+            continue
+        px = float(px_map[code])
+        proceeds = qty * px
+        sf = fees_on_sell_turnover(code, proceeds, qty, commission_rate)
+        sellable[code] = can_sell - qty
+        if sellable[code] <= 0:
+            sellable.pop(code, None)
+        cash += proceeds - sf
+        turnover_sell += proceeds
+        _append_order("卖出", code, qty, px, "rebalance-减配")
+
+    # 3) 卖出后按最新 NAV 重算目标股数，再按权重优先买入
+    nav = cash + _portfolio_mv_at_px(px_map, sellable, locked)
+    desired = desired_shares_from_target_weights(nav, tw, px_map, lot_size, scores_map)
+    buy_codes = sorted(
+        [c for c in desired if _total_shares_dict(sellable, locked, c) < desired[c]],
+        key=lambda c: (-tw.get(c, 0.0), c),
+    )
+    for code in buy_codes:
+        px = float(px_map[code])
+        need = desired[code] - _total_shares_dict(sellable, locked, code)
+        while need >= lot_size:
+            gross = lot_size * px
+            bf = fees_on_buy_turnover(code, gross, lot_size, commission_rate)
+            if gross + bf > cash + 1e-6:
+                break
+            cash -= gross + bf
+            turnover_buy += gross
+            locked[code] = locked.get(code, 0) + lot_size
+            need -= lot_size
+            _append_order("买入", code, lot_size, px, "rebalance-按权重加仓")
+
+    return sellable, locked, cash, turnover_sell, turnover_buy, order_rows
+
+
 def run_backtest(
     scores: pd.DataFrame,
     trade_price_lut: Dict[Tuple[str, str], float],
@@ -609,27 +964,7 @@ def run_backtest(
         )
 
     def _pick_picks_df(day_idx: pd.DataFrame) -> pd.DataFrame:
-        sorted_df = day_idx.sort_values("pred_score", ascending=False).reset_index(drop=True)
-        pool = sorted_df.head(min(n, len(sorted_df)))
-        k_eff = min(k, len(pool))
-        return pool.head(k_eff)
-
-    def _weighted_buy_with_cash(
-        trade_day: str,
-        budget_cash: float,
-        picks_df: pd.DataFrame,
-        scores_map_local: Dict[str, float],
-    ) -> Tuple[Dict[str, int], float, float]:
-        """用 budget_cash 按分数加权买入（整手）；返回 (locked 增量, 买入成交额 gross, 买入侧费用合计)。"""
-        px_map: Dict[str, float] = {}
-        for _, row in picks_df.iterrows():
-            code = str(row["ts_code"])
-            px = trade_px_on(trade_day, code)
-            if np.isfinite(px) and px > 0:
-                px_map[code] = float(px)
-        return score_weighted_buys_for_cash_budget(
-            px_map, budget_cash, picks_df, scores_map_local, lot_size, commission_rate
-        )
+        return pick_target_picks_df(day_idx, n, k)
 
     for di, d in enumerate(dates):
         _unlock_morning(sellable, locked)
@@ -679,54 +1014,35 @@ def run_backtest(
             rows.append(_curve_row(d, nav, cash, _n_positions(), score_date_=score_date))
             continue
 
-        # 交易逻辑（作业推荐）：卖出现有持仓中得分最低的 k 只，再买入候选里得分最高且当前未持有的标的。
-        turnover_sell = 0.0
-        sell_fees = 0.0
-        held_codes = sorted(
-            {c for c, sh in sellable.items() if sh > 0} | {c for c, sh in locked.items() if sh > 0}
-        )
-        target_codes = [str(c) for c in picks_df["ts_code"].astype(str).tolist()]
-        target_set = set(target_codes)
-
-        sell_candidates = [c for c in held_codes if c in sellable and c not in target_set]
-        sell_candidates = sorted(sell_candidates, key=lambda c: (scores_map.get(c, -np.inf), c))
-        sell_codes = sell_candidates[: max(0, int(k))]
-        for code in sell_codes:
-            sh0 = sellable.get(code, 0)
-            qty = floor_to_lot(sh0, lot_size)
-            if qty <= 0:
-                continue
+        px_map: Dict[str, float] = {}
+        for _, row in picks_df.iterrows():
+            code = str(row["ts_code"])
             px = trade_px_on(d, code)
-            if not np.isfinite(px):
-                continue
-            proceeds = qty * px
-            sf = fees_on_sell_turnover(code, proceeds, qty, commission_rate)
-            sellable[code] = sh0 - qty
-            if sellable[code] <= 0:
-                sellable.pop(code, None)
-            cash += proceeds - sf
-            turnover_sell += proceeds
-            sell_fees += sf
+            if np.isfinite(px) and px > 0:
+                px_map[code] = float(px)
 
-        nav_before = cash + _mv_shares(trade_px_on, d, sellable, locked)
-        if nav_before <= 1e-9:
-            rows.append(_curve_row(d, nav_before, cash, _n_positions(), score_date_=score_date))
-            continue
+        sellable, locked, cash, turnover_sell, turnover_buy, order_rows = daily_rotation_trades(
+            px_map,
+            picks_df,
+            scores_map,
+            sellable,
+            locked,
+            cash,
+            lot_size,
+            commission_rate,
+            n,
+            k,
+        )
+        fee_day = 0.0
+        for ord_row in order_rows:
+            amt = float(ord_row["amount"])
+            sh = int(ord_row["shares"])
+            code = str(ord_row["ts_code"])
+            if ord_row["side"] == "卖出":
+                fee_day += fees_on_sell_turnover(code, amt, sh, commission_rate)
+            else:
+                fee_day += fees_on_buy_turnover(code, amt, sh, commission_rate)
 
-        held_after_sell = {
-            c for c, sh in sellable.items() if sh > 0
-        } | {c for c, sh in locked.items() if sh > 0}
-        slots = max(0, int(k) - len(held_after_sell))
-        buy_candidates = [c for c in target_codes if c not in held_after_sell]
-        buy_codes = buy_candidates[:slots]
-        if buy_codes:
-            picks_buy_df = picks_df[picks_df["ts_code"].astype(str).isin(set(buy_codes))].copy()
-            tmp_locked, spent, buy_fees = _weighted_buy_with_cash(d, cash, picks_buy_df, scores_map)
-        else:
-            tmp_locked, spent, buy_fees = {}, 0.0, 0.0
-        fee_day = sell_fees + buy_fees
-        cash = cash - spent - buy_fees
-        locked.update(tmp_locked)
         nav_after = cash + _mv_shares(trade_px_on, d, sellable, locked)
         rows.append(
             _curve_row(
@@ -736,7 +1052,7 @@ def run_backtest(
                 _n_positions(),
                 score_date_=score_date,
                 turnover_sell_=turnover_sell if turnover_sell > 1e-9 else np.nan,
-                turnover_buy_=spent,
+                turnover_buy_=turnover_buy if turnover_buy > 1e-9 else np.nan,
                 commission_=fee_day,
             )
         )
@@ -763,6 +1079,9 @@ def run_backtest(
         "lot_size": float(lot_size),
         "score_lag": float(score_lag),
         "strategy": STRATEGY,
+        "rebalance_model": "hold_top_n_daily_rotate_k",
+        "hold_n": float(n),
+        "rotate_k": float(k),
         "broker_commission_rate": float(commission_rate),
         "fee_model_cn_a_note": (
             "stamp_sell_rate=0.1%; transfer=SSE 60* only, by shares * 0.00006 per leg (min 1 CNY); "
@@ -778,12 +1097,12 @@ def main() -> None:
     parser.add_argument("--scores", default="outputs/val_scores.csv")
     parser.add_argument("--data-root", default=os.environ.get("DL_DATA_ROOT", ""))
     parser.add_argument("--cash", type=float, default=1_000_000.0)
-    parser.add_argument("--n", type=int, default=30)
+    parser.add_argument("--n", type=int, default=20)
     parser.add_argument(
         "--k",
         type=int,
-        default=10,
-        help="实际持仓只数：在候选池 Top-n 中取分数最高的 k 只，按 pred_score 加权配置权重",
+        default=4,
+        help="日度换仓只数：有持仓时每日卖出低分 k 只、买入高分 k 只；空仓建仓忽略 k",
     )
     parser.add_argument(
         "--lot-size",

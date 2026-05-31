@@ -17,12 +17,15 @@ import pandas as pd
 
 from data_preprocess import resolve_data_root
 from backtest import (
+    fees_on_buy_turnover,
     fees_on_sell_turnover,
-    floor_to_lot,
-    score_weighted_buys_for_cash_budget,
     load_scores,
     score_weights_from_picks_df,
-    _unlock_morning,
+    score_weights_from_picks_df,
+    target_weights_from_panel,
+    daily_rotation_trades,
+    portfolio_has_holdings,
+    _portfolio_mv_at_px,
 )
 
 
@@ -236,25 +239,250 @@ def _mv(px_map: Dict[str, float], sellable: Dict[str, int], locked: Dict[str, in
 
 
 def pick_picks_df(day_idx: pd.DataFrame, n: int, k: int) -> pd.DataFrame:
-    """候选池 Top-n，持仓 Top-k（分数），与 backtest.run_backtest 一致。"""
-    sorted_df = day_idx.sort_values("pred_score", ascending=False).reset_index(drop=True)
-    pool = sorted_df.head(min(n, len(sorted_df)))
-    k_eff = min(k, len(pool))
-    return pool.head(k_eff).copy()
+    """候选池 Top-n，持仓 Top-k（分数），与 backtest 一致。"""
+    picks_df, _ = target_weights_from_panel(day_idx, n, k)
+    return picks_df
 
 
-def weighted_allocate_shares(
-    px_map: Dict[str, float],
+def build_target_weight_rows(
+    picks_df: pd.DataFrame,
+    wmap: Dict[str, float],
     budget_cash: float,
+) -> List[Dict[str, Any]]:
+    """生成含 target_weight、target_amount（元）的目标持仓行。"""
+    budget = max(float(budget_cash), 0.0)
+    rows: List[Dict[str, Any]] = []
+    for _, r in picks_df.iterrows():
+        code = str(r["ts_code"])
+        w = float(wmap.get(code, 0.0))
+        rows.append(
+            {
+                "ts_code": code,
+                "pred_score": float(r["pred_score"]),
+                "target_weight": w,
+                "target_amount": round(budget * w, 2),
+            }
+        )
+    return rows
+
+
+def planned_buy_rows_for_rotation(
     picks_df: pd.DataFrame,
     scores_map: Dict[str, float],
-    lot_size: int,
-    commission_rate: float,
-) -> Tuple[Dict[str, int], float, float]:
-    """按 pred_score 加权分配整手股数；返回 (代码→股数, 买入成交额 gross, 买入侧费用合计)。"""
-    return score_weighted_buys_for_cash_budget(
-        px_map, budget_cash, picks_df, scores_map, lot_size, commission_rate
+    sellable: Dict[str, int],
+    locked: Dict[str, int],
+    n: int,
+    k: int,
+    buy_budget_cash: float,
+) -> List[Dict[str, Any]]:
+    """有持仓时，按 trim + rotate-k 规则预估次日买入标的及参考金额（不含价格）。"""
+    if not portfolio_has_holdings(sellable, locked):
+        return []
+    held = {c for c, sh in sellable.items() if sh > 0} | {c for c, sh in locked.items() if sh > 0}
+    target_codes = [str(c) for c in picks_df["ts_code"].astype(str).tolist()]
+    target_set = set(target_codes)
+    out_of_pool = {c for c in held if c not in target_set}
+    held_in_pool = held - out_of_pool
+    trim_sold = len(out_of_pool)
+    rotate_sold = min(max(0, int(k)), len(held_in_pool))
+    held_after = len(held) - trim_sold - rotate_sold
+    slots_to_n = max(0, int(n) - held_after)
+    buy_names = min(slots_to_n, trim_sold + rotate_sold, len(target_codes))
+    buy_pool = [
+        c
+        for c in sorted(
+            target_codes,
+            key=lambda c: (-scores_map.get(c, -np.inf), c),
+        )
+        if c not in held
+    ]
+    buy_codes = buy_pool[:buy_names]
+    if not buy_codes or buy_budget_cash <= 1e-9:
+        return []
+    picks_buy = picks_df[picks_df["ts_code"].astype(str).isin(set(buy_codes))].copy()
+    w_buy = score_weights_from_picks_df(picks_buy)
+    budget = float(buy_budget_cash)
+    out: List[Dict[str, Any]] = []
+    for _, r in picks_buy.iterrows():
+        code = str(r["ts_code"])
+        w = float(w_buy.get(code, 0.0))
+        out.append(
+            {
+                "ts_code": code,
+                "pred_score": float(r["pred_score"]),
+                "target_weight": w,
+                "target_amount": round(budget * w, 2),
+            }
+        )
+    return sorted(out, key=lambda x: (-x["pred_score"], x["ts_code"]))
+
+
+def enrich_orders_with_targets(
+    order_rows: List[Dict[str, Any]],
+    full_weight_map: Dict[str, float],
+    full_amount_map: Dict[str, float],
+    buy_only_weight_map: Optional[Dict[str, float]] = None,
+    buy_only_amount_map: Optional[Dict[str, float]] = None,
+) -> List[Dict[str, Any]]:
+    """为撮合指令补充目标权重与参考/目标金额。"""
+    out: List[Dict[str, Any]] = []
+    for row in order_rows:
+        code = str(row["ts_code"])
+        side = str(row["side"])
+        item = dict(row)
+        if side == "买入":
+            bw = (buy_only_weight_map or {}).get(code)
+            ba = (buy_only_amount_map or {}).get(code)
+            if bw is not None:
+                item["target_weight"] = float(bw)
+            else:
+                item["target_weight"] = float(full_weight_map.get(code, 0.0))
+            if ba is not None:
+                item["target_amount"] = round(float(ba), 2)
+            else:
+                item["target_amount"] = round(float(full_amount_map.get(code, 0.0)), 2)
+        else:
+            item["target_weight"] = float(full_weight_map.get(code, 0.0))
+            item["target_amount"] = None
+        item["amount"] = round(float(item.get("amount", 0.0)), 2)
+        out.append(item)
+    return out
+
+
+def consolidate_orders_by_code(order_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """同一标的、同一方向的多笔整手委托合并为一行。"""
+    if not order_rows:
+        return []
+    df = pd.DataFrame(order_rows)
+    if df.empty:
+        return []
+    agg: Dict[str, Any] = {
+        "shares": "sum",
+        "amount": "sum",
+    }
+    for col in ("target_weight", "target_amount", "price", "phase"):
+        if col in df.columns:
+            agg[col] = "first"
+    grouped = (
+        df.groupby(["side", "ts_code"], as_index=False)
+        .agg(agg)
+        .sort_values(["side", "ts_code"])
+        .reset_index(drop=True)
     )
+    grouped["amount"] = grouped["amount"].astype(float).round(2)
+    grouped["price"] = (grouped["amount"] / grouped["shares"].replace(0, np.nan)).astype(float)
+    grouped.loc[~np.isfinite(grouped["price"]), "price"] = np.nan
+    return grouped.to_dict(orient="records")
+
+
+def build_target_weights_plan(
+    panel: pd.DataFrame,
+    n: int,
+    k: int,
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    """仅基于 pred_score 生成 Top-n 目标权重（不含价格、不含股数）。"""
+    day_idx = panel.drop_duplicates(subset=["ts_code"]).reset_index(drop=True)
+    return target_weights_from_panel(day_idx, n, k)
+
+
+def load_target_weights_plan(path: str) -> Tuple[Dict[str, float], Dict[str, Any]]:
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    rows = raw.get("target_weights") or raw.get("targets") or []
+    if not rows:
+        raise ValueError(f"计划文件缺少 target_weights: {path}")
+    weights: Dict[str, float] = {}
+    for row in rows:
+        code = str(row["ts_code"])
+        w = float(row.get("target_weight", row.get("weight", 0.0)))
+        if w > 0:
+            weights[code] = w
+    if not weights:
+        raise ValueError(f"计划文件 target_weights 为空: {path}")
+    tot = sum(weights.values())
+    if tot <= 1e-18:
+        raise ValueError("target_weights 之和无效")
+    weights = {c: w / tot for c, w in weights.items()}
+    return weights, raw
+
+
+def execute_rotation_at_open(
+    picks_df: pd.DataFrame,
+    px_map: Dict[str, float],
+    scores_map: Dict[str, float],
+    st: PortfolioState,
+    n: int,
+    k: int,
+    commission_rate: float,
+    *,
+    full_weight_map: Optional[Dict[str, float]] = None,
+    budget_cash: Optional[float] = None,
+) -> Tuple[OrderLog, PortfolioState, float, float, str, List[Dict[str, Any]]]:
+    """在开盘价下执行 Top-n 持仓 + 日度换 k 逻辑。"""
+    log = OrderLog()
+    wmap = full_weight_map or score_weights_from_picks_df(picks_df)
+    budget = float(st.cash if budget_cash is None else budget_cash)
+    full_amount_map = {c: budget * w for c, w in wmap.items()}
+
+    sellable, locked, cash, _ts, _tb, order_rows = daily_rotation_trades(
+        px_map,
+        picks_df,
+        scores_map,
+        st.sellable,
+        st.locked,
+        st.cash,
+        st.lot_size,
+        commission_rate,
+        n,
+        k,
+    )
+
+    buy_only_amount_map: Dict[str, float] = {}
+    buy_only_weight_map: Dict[str, float] = {}
+    if portfolio_has_holdings(st.sellable, st.locked):
+        buy_rows = planned_buy_rows_for_rotation(
+            picks_df, scores_map, st.sellable, st.locked, n, k, cash if cash > 0 else budget
+        )
+        for row in buy_rows:
+            code = str(row["ts_code"])
+            buy_only_weight_map[code] = float(row["target_weight"])
+            buy_only_amount_map[code] = float(row["target_amount"])
+
+    enriched = enrich_orders_with_targets(
+        order_rows,
+        wmap,
+        full_amount_map,
+        buy_only_weight_map=buy_only_weight_map or None,
+        buy_only_amount_map=buy_only_amount_map or None,
+    )
+    enriched = consolidate_orders_by_code(enriched)
+
+    fee_day = 0.0
+    for row in enriched:
+        amt = float(row["amount"])
+        sh = int(row["shares"])
+        code = str(row["ts_code"])
+        if row["side"] == "卖出":
+            fee_day += fees_on_sell_turnover(code, amt, sh, commission_rate)
+            log.sell(code, sh, float(row["price"]), str(row.get("phase", "")))
+        else:
+            fee_day += fees_on_buy_turnover(code, amt, sh, commission_rate)
+            log.buy(code, sh, float(row["price"]), str(row.get("phase", "")))
+
+    sellable_f = {c: int(sh) for c, sh in sellable.items() if sh > 0}
+    locked_f = {c: int(sh) for c, sh in locked.items() if sh > 0}
+    nav_after = cash + _portfolio_mv_at_px(px_map, sellable_f, locked_f)
+    ps = PortfolioState(
+        cash=cash,
+        lot_size=st.lot_size,
+        sellable=sellable_f,
+        locked=locked_f,
+        commission_rate=commission_rate,
+    )
+    if portfolio_has_holdings(st.sellable, st.locked):
+        note = f"execute-at-open：持有 Top-{n}，卖出低分 {k} 只、买入高分 {k} 只"
+    else:
+        note = f"execute-at-open：空仓初始建仓 Top-{n}（忽略 k={k}）"
+    return log, ps, fee_day, nav_after, note, enriched
 
 
 def simulate_score_weighted_day(
@@ -266,82 +494,13 @@ def simulate_score_weighted_day(
     k: int,
     commission_rate: float,
 ) -> Tuple[OrderLog, PortfolioState, float, float, str]:
-    """与 run_backtest 一致：早盘解锁 → 卖出最低分 k 只（不在目标持仓）→ 买入最高分缺口（含 A 股费用）。"""
-    log = OrderLog()
-    sellable = dict(st.sellable)
-    locked = dict(st.locked)
-    cash = float(st.cash)
-    lot_size = st.lot_size
-
-    _unlock_morning(sellable, locked)
-
-    day_idx = panel.drop_duplicates(subset=["ts_code"]).reset_index(drop=True)
-    picks_df = pick_picks_df(day_idx, n, k)
+    """与 run_backtest 一致：Top-n 持仓，有仓日度换 k，空仓建 n。"""
+    picks_df, _ = build_target_weights_plan(panel, n, k)
     if picks_df.empty:
-        nav = cash + _mv(px_map, sellable, locked)
-        ps = PortfolioState(cash, lot_size, sellable, locked, st.commission_rate)
-        return log, ps, 0.0, nav, "无候选标的"
-
-    turnover_sell = 0.0
-    sell_fees = 0.0
-    held_codes = sorted(
-        {c for c, sh in sellable.items() if sh > 0} | {c for c, sh in locked.items() if sh > 0}
-    )
-    target_codes = [str(c) for c in picks_df["ts_code"].astype(str).tolist()]
-    target_set = set(target_codes)
-    sell_candidates = [c for c in held_codes if c in sellable and c not in target_set]
-    sell_candidates = sorted(sell_candidates, key=lambda c: (scores_map.get(c, -np.inf), c))
-    sell_codes = sell_candidates[: max(0, int(k))]
-    for code in sell_codes:
-        sh0 = sellable.get(code, 0)
-        qty = floor_to_lot(sh0, lot_size)
-        if qty <= 0:
-            continue
-        px = float(px_map.get(code, float("nan")))
-        if not np.isfinite(px):
-            continue
-        proceeds = qty * px
-        sf = fees_on_sell_turnover(code, proceeds, qty, commission_rate)
-        sellable[code] = sh0 - qty
-        if sellable[code] <= 0:
-            sellable.pop(code, None)
-        cash += proceeds - sf
-        turnover_sell += proceeds
-        sell_fees += sf
-        log.sell(code, qty, px, "score_weighted-卖出低分持仓")
-
-    nav_before = cash + _mv(px_map, sellable, locked)
-    if nav_before <= 1e-9:
-        nav_after = cash + _mv(px_map, sellable, locked)
-        ps = PortfolioState(cash, lot_size, sellable, locked, st.commission_rate)
-        return log, ps, 0.0, nav_after, "现金不足以建仓"
-
-    held_after_sell = {c for c, sh in sellable.items() if sh > 0} | {c for c, sh in locked.items() if sh > 0}
-    slots = max(0, int(k) - len(held_after_sell))
-    buy_candidates = [c for c in target_codes if c not in held_after_sell]
-    buy_codes = buy_candidates[:slots]
-    if buy_codes:
-        picks_buy_df = picks_df[picks_df["ts_code"].astype(str).isin(set(buy_codes))].copy()
-        tmp_locked, spent, buy_fees = weighted_allocate_shares(
-            px_map, cash, picks_buy_df, scores_map, lot_size, commission_rate
-        )
-    else:
-        tmp_locked, spent, buy_fees = {}, 0.0, 0.0
-    fee_day = sell_fees + buy_fees
-    for code, sh in tmp_locked.items():
-        log.buy(code, sh, float(px_map[code]), "score_weighted-买入高分候选")
-
-    cash = cash - spent - buy_fees
-    locked.update(tmp_locked)
-    nav_after = cash + _mv(px_map, sellable, locked)
-    ps = PortfolioState(
-        cash=cash,
-        lot_size=lot_size,
-        sellable=sellable,
-        locked=locked,
-        commission_rate=st.commission_rate,
-    )
-    return log, ps, fee_day, nav_after, "score_weighted：卖出低分持仓 k 只，买入高分候选补齐至 Top-k"
+        nav = float(st.cash) + _portfolio_mv_at_px(px_map, st.sellable, st.locked)
+        ps = PortfolioState(st.cash, st.lot_size, dict(st.sellable), dict(st.locked), st.commission_rate)
+        return OrderLog(), ps, 0.0, nav, "无候选标的"
+    return execute_rotation_at_open(picks_df, px_map, scores_map, st, n, k, commission_rate)[:5]
 
 
 def run_simulation(
@@ -452,7 +611,7 @@ def print_advisory_summary(
     print(f"score-lag → 使用的打分快照 trade_date = {score_snap}")
     print(f"说明: {snap_note}")
     print(f"快照股票数（去重后）: {len(panel)}")
-    print(f"\n=== score_weighted：候选池 Top-{n}，持仓 Top-{k}；权重 ∝ pred_score（池内平移后归一）===")
+    print(f"\n=== 目标持仓 Top-{n}；有仓时日换 {k} 只；权重 ∝ pred_score（Top-n 内归一）===")
     print("\n--- 目标持仓（代码 / 分数 / 目标权重）---")
     cols = [c for c in ("ts_code", "pred_score", "target_weight") if c in top_df.columns]
     print(top_df[cols].to_string(index=False))
@@ -460,36 +619,44 @@ def print_advisory_summary(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="下一交易日操作建议：摘要模式 或 --state 细单模式（买卖股数）",
+        description="下一交易日：plan 仅输出目标权重；execute 在开盘价下换算股数",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="未建仓: examples/state_empty.json；已建仓: examples/state_holding.json",
+        epilog=(
+            "典型流程：\n"
+            "  1) 盘后 plan：python predict.py --mode plan --scores ... --next-trade-date ...\n"
+            "  2) 开盘 execute：python predict.py --mode execute --plan plan.json --state state.json "
+            "--next-trade-date ... --strict-next-trade-csv\n"
+            "未建仓 state 示例: examples/state_empty.json"
+        ),
     )
-    parser.add_argument("--scores", required=True)
+    parser.add_argument("--mode", choices=("plan", "execute", "legacy"), default="plan")
+    parser.add_argument("--scores", default="", help="plan / legacy 模式必填")
+    parser.add_argument("--plan", default="", help="execute 模式：plan JSON（含 target_weights）")
     parser.add_argument(
         "--data-root",
         default=os.environ.get("DL_DATA_ROOT", ""),
     )
-    parser.add_argument("--next-trade-date", default="", help="下一交易日 YYYYMMDD（细单模式必填或可自动推断）")
-    parser.add_argument("--n", type=int, default=30, help="打分截面上取分数最高的 n 只组成候选池")
-    parser.add_argument("--k", type=int, default=10, help="在候选池内持有分数最高的 k 只")
+    parser.add_argument("--next-trade-date", default="", help="下一交易日 YYYYMMDD")
+    parser.add_argument("--n", type=int, default=20, help="同一时段目标持有股票只数 Top-n")
+    parser.add_argument("--k", type=int, default=4, help="有持仓时日度换仓只数（空仓建仓忽略 k）")
     parser.add_argument("--score-lag", type=int, default=1)
     parser.add_argument("--lot-size", type=int, default=None, help="不传则用 state 或默认 100")
-    parser.add_argument("--holdings", default="", help="摘要模式：简易持仓 CSV；细单模式：可在 state 空仓时合并进来")
+    parser.add_argument("--holdings", default="", help="execute：可在 state 空仓时合并简易持仓 CSV")
     parser.add_argument(
         "--state",
         default="",
-        help="portfolio_state.json：现金 + sellable + locked；启用细单模式",
+        help="plan / execute / legacy：portfolio_state.json（plan 用于计算 budget_cash 与 target_amount）",
     )
     parser.add_argument(
         "--strict-next-trade-csv",
         action="store_true",
-        help="必须为当日生成 daily/{{--next-trade-date}}.csv；禁止在无文件时用更早交易日的成交价占位",
+        help="必须为当日生成 daily/{{--next-trade-date}}.csv；execute 模式强烈建议开启",
     )
     parser.add_argument(
         "--trade-price-col",
         choices=("open", "close"),
         default="open",
-        help="交易撮合价格列（默认 open，满足每日开盘买卖）",
+        help="execute / legacy：撮合价格列（默认 open）",
     )
     parser.add_argument(
         "--commission-rate",
@@ -503,13 +670,194 @@ def main() -> None:
         default=None,
         help="兼容旧参数：基点制（万三=3），若提供则覆盖 --commission-rate",
     )
-    parser.add_argument("--out-csv", default="", help="摘要模式：写出目标池 CSV")
-    parser.add_argument("--out-orders", default="", help="细单模式：写出指令明细 CSV")
-    parser.add_argument("--out-next-state", default="", help="细单模式：写出推演收盘后状态 JSON（次日链式）")
+    parser.add_argument("--out-plan", default="", help="plan 模式：写出目标权重 JSON")
+    parser.add_argument("--out-csv", default="", help="plan 模式：写出目标权重 CSV")
+    parser.add_argument("--out-orders", default="", help="execute / legacy：写出指令明细 CSV")
+    parser.add_argument("--out-next-state", default="", help="execute / legacy：写出推演收盘后状态 JSON")
     args = parser.parse_args()
 
     args.data_root = resolve_data_root(args.data_root)
 
+    if args.mode == "plan":
+        if not args.scores:
+            raise SystemExit("plan 模式需要 --scores")
+        scores = load_scores(args.scores)
+        dates = sorted(scores["trade_date"].unique())
+        if not dates:
+            raise SystemExit("scores 为空")
+
+        last_s = dates[-1]
+        next_d = args.next_trade_date.strip().replace("-", "")
+        if not next_d:
+            next_d = infer_next_trade_date_from_daily(args.data_root, last_s) or ""
+        if not (next_d.isdigit() and len(next_d) == 8):
+            raise SystemExit("plan 模式需要有效的 --next-trade-date YYYYMMDD（或确保 daily/ 可推断）")
+
+        score_snap, snap_note = score_snapshot_date_for_day(dates, next_d, args.score_lag)
+        panel = scores[scores["trade_date"] == score_snap].drop_duplicates(subset=["ts_code"]).copy()
+        panel = panel.sort_values("pred_score", ascending=False).reset_index(drop=True)
+        picks_df, wmap = build_target_weights_plan(panel, args.n, args.k)
+        budget_cash = 0.0
+        sellable: Dict[str, int] = {}
+        locked: Dict[str, int] = {}
+        if args.state:
+            st_plan = load_portfolio_json(args.state)
+            budget_cash = float(st_plan.cash)
+            sellable = dict(st_plan.sellable)
+            locked = dict(st_plan.locked)
+
+        target_rows = build_target_weight_rows(picks_df, wmap, budget_cash)
+        planned_buys = planned_buy_rows_for_rotation(
+            picks_df,
+            panel.set_index("ts_code")["pred_score"].astype(float).to_dict(),
+            sellable,
+            locked,
+            args.n,
+            args.k,
+            budget_cash,
+        )
+        top_df = pd.DataFrame(target_rows)
+
+        print("=== plan：目标权重与参考购买金额（不含股数 / 不含占位价格） ===")
+        print(f"下一交易日: {next_d}")
+        print(f"打分快照 trade_date = {score_snap}")
+        print(f"说明: {snap_note}")
+        print(f"预算现金 budget_cash = {budget_cash:.2f} 元")
+        print(f"目标持仓 Top-{args.n}；有仓时日换 {args.k} 只；权重 ∝ pred_score（Top-n 内归一）")
+        print("\n--- 目标持仓（权重 / 参考金额）---")
+        print(top_df[["ts_code", "pred_score", "target_weight", "target_amount"]].to_string(index=False))
+        if planned_buys:
+            print(f"\n--- 预估买入 Top-{args.k}（按 rotate-k，参考金额=预算现金×买入权重）---")
+            print(pd.DataFrame(planned_buys)[["ts_code", "pred_score", "target_weight", "target_amount"]].to_string(index=False))
+        print("\n提示：target_amount 为参考金额；execute 阶段按 open 价换算整手股数。")
+
+        plan_payload = {
+            "workflow": "plan-target-weights",
+            "next_trade_date": next_d,
+            "score_snapshot_trade_date": score_snap,
+            "score_snapshot_note": snap_note,
+            "score_lag": int(args.score_lag),
+            "hold_n": int(args.n),
+            "rotate_k": int(args.k),
+            "budget_cash": round(budget_cash, 2),
+            "target_weights": target_rows,
+            "planned_buys": planned_buys,
+            "artifacts": {"scores_csv": args.scores},
+            "notes": (
+                "target_weights：Top-n 目标权重与参考购买金额（target_amount=budget_cash×target_weight）。"
+                "planned_buys：有持仓时按 rotate-k 预估的次日买入标的及参考金额。"
+                "execute-next 在 open 价下生成实际 orders（含 target_weight / target_amount / amount）。"
+            ),
+        }
+        if args.out_plan:
+            outp = Path(args.out_plan)
+            outp.parent.mkdir(parents=True, exist_ok=True)
+            with open(outp, "w", encoding="utf-8") as f:
+                json.dump(plan_payload, f, ensure_ascii=False, indent=2)
+            print(f"\n已写 plan JSON: {outp}")
+        if args.out_csv:
+            outp = Path(args.out_csv)
+            outp.parent.mkdir(parents=True, exist_ok=True)
+            top_df.assign(next_trade_date=str(next_d), score_snapshot_date=score_snap).to_csv(outp, index=False)
+            print(f"已写 plan CSV: {outp}")
+        return
+
+    if args.mode == "execute":
+        if not args.plan:
+            raise SystemExit("execute 模式需要 --plan")
+        if not args.state:
+            raise SystemExit("execute 模式需要 --state")
+        next_d = args.next_trade_date.strip().replace("-", "")
+        if not (next_d.isdigit() and len(next_d) == 8):
+            raise SystemExit("execute 模式需要有效的 --next-trade-date YYYYMMDD")
+
+        target_weights, plan_raw = load_target_weights_plan(args.plan)
+        hold_n = int(plan_raw.get("hold_n", plan_raw.get("candidate_pool_n", args.n)))
+        rotate_k = int(plan_raw.get("rotate_k", plan_raw.get("hold_top_k", args.k)))
+        rows = plan_raw.get("target_weights") or []
+        picks_df = pd.DataFrame(rows)
+        if picks_df.empty:
+            raise SystemExit("plan 中 target_weights 为空")
+        if "pred_score" not in picks_df.columns:
+            raise SystemExit("plan.target_weights 缺少 pred_score")
+        scores_map = picks_df.set_index("ts_code")["pred_score"].astype(float).to_dict()
+
+        plan_trade_date = str(plan_raw.get("next_trade_date", "")).strip().replace("-", "")
+        if plan_trade_date and plan_trade_date != next_d:
+            print(
+                f"[警告] plan.next_trade_date={plan_trade_date} 与 --next-trade-date={next_d} 不一致，"
+                "以命令行 execute 日为准。",
+                file=sys.stderr,
+            )
+
+        px_date, px_note = resolve_equity_trade_price_date(
+            args.data_root,
+            next_d,
+            strict=True if args.strict_next_trade_csv else False,
+            price_col=str(args.trade_price_col),
+        )
+        if args.strict_next_trade_csv and px_date != next_d:
+            raise SystemExit(
+                f"--strict-next-trade-csv：要求 {next_d} 当天 CSV，但实际映射到 {px_date}。"
+            )
+        price_col_used = effective_trade_price_col(str(args.trade_price_col), str(next_d), str(px_date))
+        if px_note:
+            print(px_note, flush=True)
+        if price_col_used != args.trade_price_col:
+            print(
+                f"[警告] 请求列={args.trade_price_col}，实际使用={price_col_used}。"
+                "execute 模式建议使用 --strict-next-trade-csv 且当日 CSV 已落盘。",
+                file=sys.stderr,
+            )
+
+        px_map = load_trade_price_map_for_day(args.data_root, px_date, price_col=str(price_col_used))
+        st = load_portfolio_json(args.state)
+        if args.lot_size is not None:
+            st.lot_size = int(args.lot_size)
+        if args.holdings:
+            extra = load_holdings_csv(args.holdings)
+            for c, sh in extra.items():
+                st.sellable[c] = st.sellable.get(c, 0) + sh
+
+        if args.commission_bps is not None:
+            crate = float(args.commission_bps) / 10000.0
+        elif args.commission_rate is not None:
+            crate = float(args.commission_rate)
+        else:
+            crate = float(st.commission_rate)
+
+        log, ps_end, fee, nav_after, sim_note, enriched_orders = execute_rotation_at_open(
+            picks_df, px_map, scores_map, st, hold_n, rotate_k, crate
+        )
+
+        print("=== execute-at-open：Top-n 持仓 + 日度换 k ===")
+        print(f"执行交易日: {next_d}  |  成交价 CSV 日: {px_date}  |  价格列: {price_col_used}")
+        print(f"hold_n={hold_n}  rotate_k={rotate_k}")
+        print(f"推演说明: {sim_note}")
+        print(f"交易费用估算合计 ≈ {fee:.2f} 元；推演净值 ≈ {nav_after:.2f} 元；现金 ≈ {ps_end.cash:.2f} 元")
+        print("\n--- 指令明细（含目标权重 / 目标金额 / 实际金额）---")
+        if not enriched_orders:
+            print("（无成交指令）")
+        else:
+            od = pd.DataFrame(enriched_orders)
+            cols = ["side", "ts_code", "shares", "price", "target_weight", "target_amount", "amount", "phase"]
+            print(od[[c for c in cols if c in od.columns]].to_string(index=False))
+
+        if args.out_orders:
+            Path(args.out_orders).parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(enriched_orders).to_csv(args.out_orders, index=False)
+            print(f"\n已写指令: {args.out_orders}")
+        if args.out_next_state:
+            save_portfolio_json(
+                args.out_next_state,
+                PortfolioState(ps_end.cash, ps_end.lot_size, dict(ps_end.sellable), dict(ps_end.locked), crate),
+            )
+            print(f"已写下一状态: {args.out_next_state}")
+        return
+
+    # ---------- legacy：plan+execute 一步（兼容旧流程；无当日 CSV 时可能用占位价） ----------
+    if not args.scores:
+        raise SystemExit("legacy 模式需要 --scores")
     scores = load_scores(args.scores)
     dates = sorted(scores["trade_date"].unique())
     if not dates:

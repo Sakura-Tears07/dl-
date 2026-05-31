@@ -1129,21 +1129,10 @@ def main() -> None:
     loss_fn = nn.SmoothL1Loss(beta=0.01)
 
     last_bundle = None
-    best_bundle = None
-    best_state_dict = None
-    best_epoch = 0
-    best_score = float("-inf")
-    bad_epochs = 0
-    early_stop_enabled = (
-        (not args.disable_early_stop)
-        and args.workflow == "backtest"
-        and len(val_ds) > 0
-    )
-    if main_rank and early_stop_enabled:
-        print(
-            f"[early_stop] on metric={args.early_stop_metric}, patience={args.early_stop_patience}, "
-            f"min_epochs={args.early_stop_min_epochs}, min_delta={args.early_stop_min_delta}"
-        )
+    # 兼容保留相关参数，但不再启用早停：固定训练到 args.epochs
+    early_stop_enabled = False
+    if main_rank and args.workflow == "backtest" and len(val_ds) > 0:
+        print("[early_stop] disabled: fixed-epoch training is enabled")
     for epoch in range(1, args.epochs + 1):
         if use_ddp:
             train_sampler.set_epoch(epoch)
@@ -1194,7 +1183,6 @@ def main() -> None:
         has_val = len(val_ds) > 0
         val_loss = float("nan")
         bundle = None
-        stop_training = False
         if main_rank:
             # DDP 下不可仅在 rank0 对包装后的 model 做 forward（会触发 NCCL 死锁）；对裸模块 core 推理。
             core.eval()
@@ -1229,31 +1217,6 @@ def main() -> None:
                     f"  val_loss={val_loss:.6f}  "
                     f"{format_metrics_line(bundle)}"
                 )
-                if early_stop_enabled:
-                    score = _early_stop_score(args.early_stop_metric, bundle, val_loss)
-                    improved = np.isfinite(score) and (
-                        best_epoch == 0 or score > (best_score + args.early_stop_min_delta)
-                    )
-                    if improved:
-                        best_score = float(score)
-                        best_epoch = int(epoch)
-                        bad_epochs = 0
-                        best_bundle = bundle
-                        best_state_dict = {
-                            k: v.detach().cpu().clone() for k, v in core.state_dict().items()
-                        }
-                        print(
-                            f"[early_stop] improved @epoch={epoch}, "
-                            f"{args.early_stop_metric}={score:.6f}"
-                        )
-                    elif epoch >= args.early_stop_min_epochs:
-                        bad_epochs += 1
-                        if bad_epochs >= args.early_stop_patience:
-                            stop_training = True
-                            print(
-                                f"[early_stop] trigger @epoch={epoch} "
-                                f"(best_epoch={best_epoch}, best_score={best_score:.6f})"
-                            )
             else:
                 print(
                     f"epoch {epoch}/{args.epochs}  train_loss={train_loss:.6f}"
@@ -1263,23 +1226,11 @@ def main() -> None:
         else:
             core.eval()
 
-        if use_ddp:
-            stop_t = torch.tensor([1 if stop_training else 0], device=device, dtype=torch.int64)
-            dist.broadcast(stop_t, src=0)
-            stop_training = bool(int(stop_t.item()))
-
         _ddp_barrier(use_ddp)
-        if stop_training:
-            break
 
     _ddp_barrier(use_ddp)
 
     metrics_bundle_for_export = last_bundle
-    if early_stop_enabled and best_state_dict is not None:
-        core.load_state_dict(best_state_dict)
-        metrics_bundle_for_export = best_bundle if best_bundle is not None else last_bundle
-        if main_rank:
-            print(f"[early_stop] restored best checkpoint from epoch={best_epoch}")
 
     if main_rank and metrics_bundle_for_export is not None and args.export_metrics_json:
         _ensure_parent_dir(args.export_metrics_json)

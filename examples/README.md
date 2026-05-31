@@ -1,82 +1,66 @@
-# `examples/` 使用说明
+# 账户状态 JSON 说明
 
-本目录放的是 `predict-next` 的账户输入示例（`--state-in`）。
-你只要按这里的口径把自己的账户写成 JSON，就能直接跑出次日买卖指令。
+本目录提供 `workbench.py predict-next` 与 `execute-next` 所需的账户状态示例（`--state-in`）。
 
 ---
 
-## 1) 文件说明
+## 文件
 
-| 文件 | 场景 |
+| 文件 | 用途 |
 |---|---|
-| `state_empty.json` | 空仓起步：`sellable`、`locked` 为空，仅现金。 |
-| `state_holding.json` | 已持仓：同时有可卖仓位和锁仓仓位。 |
+| `state_empty.json` | 初始空仓：仅现金，无持仓 |
+| `state_holding.json` | 已有持仓：含可卖与锁仓仓位 |
 
 ---
 
-## 2) 必填字段（按当前策略）
+## 字段定义
 
-- `cash`：可用现金（数字）
-- `lot_size`：整手单位，A 股一般为 `100`
-- `sellable`：当日可卖仓位，格式为 `{ "ts_code": 股数 }`
-- `locked`：当日不可卖仓位（T+1），格式同上
-- `commission_rate`：券商佣金率（小数，如万二写 `0.0002`）
-
-可选字段：
-
-- `position_status`：`empty` / `holding`，仅用于可读性；脚本最终以 `sellable/locked` 为准
-- 其他自定义备注字段（如 `_说明`）会被忽略
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `cash` | number | 可用现金 |
+| `lot_size` | integer | 最小交易单位，A 股通常为 100 |
+| `sellable` | object | 可卖持仓，`{ "ts_code": 股数 }` |
+| `locked` | object | T+1 锁仓持仓，格式同上 |
+| `commission_rate` | number | 券商佣金费率（小数，如万三为 0.0003） |
+| `position_status` | string | 可选，`empty` / `holding`；最终以股数字段为准 |
 
 ---
 
-## 3) 怎么从真实账户映射成 JSON
+## 映射规则
 
-以“你现在要在下一交易日开盘执行”为准，写入规则如下：
-
-1. `cash` 写“当前可用现金”
-2. 今天就能卖出的仓位写进 `sellable`
-3. 今天不能卖（昨日或当日新买，受 T+1 约束）的写进 `locked`
-4. 股数尽量写整手（`lot_size` 的整数倍）
-5. 代码统一交易所后缀格式（如 `000001.SZ`、`600000.SH`）
+1. 将当前可用现金写入 `cash`。
+2. 执行日可卖出的仓位写入 `sellable`。
+3. 受 T+1 约束、执行日不可卖的仓位写入 `locked`。
+4. 股数应为 `lot_size` 的整数倍。
+5. 证券代码需含交易所后缀（如 `600000.SH`、`000001.SZ`）。
 
 ---
 
-## 4) 价格与时序口径（当前实现）
+## 调用示例
 
-- `score-lag=1`：用 `T-1` 的分数决策 `T` 日交易
-- 默认 `--trade-price-col open`：按 `T` 日开盘价撮合
-- 若 `daily/T.csv` 不存在且请求 `open`：显式采用“最近可用交易日 `close` 近似 `T` 日 `open`”
-
-这和“`1.1` 出信号，`1.2` 开盘执行，近似 `1.2 open ≈ 1.1 close`”一致。
-
----
-
-## 5) 推荐命令（持仓/空仓都适用）
+权重规划：
 
 ```bash
 python workbench.py predict-next \
   --data-root "$DL_DATA_ROOT" \
   --train-start 2016-01-01 \
-  --train-end 2026-01-06 \
+  --train-end 2026-05-28 \
   --export-scores outputs/wf_scores.csv \
-  --state-in examples/state_holding.json \
-  --ops-out outputs/final_ops.json \
-  --next-trade-date 20260408 \
-  --n-pool 30 \
-  --k-hold 8 \
-  --score-lag 1 \
-  --trade-price-col open \
-  --commission-rate 0.0002
+  --state-in examples/state_empty.json \
+  --ops-out outputs/final_plan.json \
+  --next-trade-date 20260529 \
+  --n-pool 30 --k-hold 8 --score-lag 1 \
+  --trade-price-col open --commission-rate 0.0003 \
+  --skip-train
 ```
 
-如果已有分数文件，记得加 `--skip-train` 只做推演。
+开盘执行：
 
----
-
-## 6) 最小自检清单
-
-- `cash >= 0`
-- `sellable` / `locked` 的股数都是正整数
-- 股票代码都带 `.SZ` / `.SH`
-- `commission_rate` 用小数而不是 bps
-- 预计执行日与 `--next-trade-date` 一致
+```bash
+python workbench.py execute-next \
+  --data-root "$DL_DATA_ROOT" \
+  --plan-in outputs/final_plan.json \
+  --state-in examples/state_empty.json \
+  --ops-out outputs/final_ops.json \
+  --trade-date 20260529
+```

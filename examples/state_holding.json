@@ -1,5 +1,5 @@
 {
-  "_说明": "已建仓示例：sellable=当日开盘即可卖；locked=受 T+1 限制、下一交易日早盘并入可卖（与回测一致）。默认按下一交易日 open 撮合；若该日缺 CSV 且请求 open，则显式采用前一可用交易日 close 近似。",
+  "_说明": "已建仓示例：sellable=当日开盘即可卖；locked=受 T+1 限制、下一交易日早盘并入可卖。用于 execute-next --state-in；predict-next 仅定权重不算股数。",
   "position_status": "holding",
   "cash": 1000000.0,
   "lot_size": 100,
