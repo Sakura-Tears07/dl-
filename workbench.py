@@ -461,6 +461,8 @@ def cmd_predict_next(ns: argparse.Namespace, train_argv: List[str]) -> None:
     plan_payload = _read_json(ns.ops_out)
     plan_payload["input_position_mode"] = pos
     plan_payload["state_in"] = ns.state_in
+    plan_payload["rebalance_style"] = str(plan_payload.get("rebalance_style", "target_tracking"))
+    plan_payload["budget_basis"] = str(plan_payload.get("budget_basis", "nav"))
     plan_payload["execute_trade_price_col"] = str(getattr(ns, "trade_price_col", "open"))
     if getattr(ns, "commission_rate", None) is not None:
         plan_payload["execute_commission_rate"] = float(ns.commission_rate)
@@ -474,7 +476,8 @@ def cmd_predict_next(ns: argparse.Namespace, train_argv: List[str]) -> None:
         json.dump(plan_payload, f, ensure_ascii=False, indent=2)
     print(
         f"[workbench] 已写目标权重 plan: {outp}（共 {len(plan_payload.get('target_weights', []))} 只；"
-        f"budget_cash={plan_payload.get('budget_cash')}；不含 orders，请运行 execute-next 用开盘价换算股数）",
+        f"budget_nav={plan_payload.get('budget_nav', plan_payload.get('budget_cash'))}；"
+        f"style={plan_payload.get('rebalance_style')}；不含 orders，请运行 execute-next 用开盘价换算股数）",
         flush=True,
     )
 
@@ -561,6 +564,8 @@ def cmd_execute_next(ns: argparse.Namespace) -> None:
             "workflow": "execute-at-open",
             "input_position_mode": pos,
             "plan_ref": ns.plan_in,
+            "rebalance_style": plan_raw.get("rebalance_style", "target_tracking"),
+            "budget_basis": plan_raw.get("budget_basis", "nav"),
             "trade_date": trade_d,
             "pricing_trade_date": px_date_used,
             "pricing_price_col": price_col_used,
@@ -573,6 +578,7 @@ def cmd_execute_next(ns: argparse.Namespace) -> None:
             "rotate_k": plan_raw.get("rotate_k", plan_raw.get("hold_top_k")),
             "target_weights": plan_raw.get("target_weights", []),
             "orders": orders_rows,
+            "budget_nav": plan_raw.get("budget_nav", plan_raw.get("budget_cash")),
             "budget_cash": plan_raw.get("budget_cash"),
             "planned_buys": plan_raw.get("planned_buys", []),
             "portfolio_after_close": next_state_raw,

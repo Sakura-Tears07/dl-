@@ -21,11 +21,13 @@ from backtest import (
     fees_on_sell_turnover,
     load_scores,
     score_weights_from_picks_df,
-    score_weights_from_picks_df,
     target_weights_from_panel,
     daily_rotation_trades,
     portfolio_has_holdings,
     _portfolio_mv_at_px,
+    filter_target_weights_tradable,
+    desired_shares_from_target_weights,
+    floor_to_lot,
 )
 
 
@@ -315,6 +317,265 @@ def planned_buy_rows_for_rotation(
             }
         )
     return sorted(out, key=lambda x: (-x["pred_score"], x["ts_code"]))
+
+
+def _unlock_locked_to_sellable(
+    sellable: Dict[str, int],
+    locked: Dict[str, int],
+) -> Tuple[Dict[str, int], Dict[str, int]]:
+    """开盘时将 locked 合并到 sellable（T+1 解锁）。"""
+    merged: Dict[str, int] = {}
+    for code in set(sellable) | set(locked):
+        tot = int(sellable.get(code, 0)) + int(locked.get(code, 0))
+        if tot > 0:
+            merged[str(code)] = tot
+    return merged, {}
+
+
+def planned_buy_rows_for_target_tracking(
+    picks_df: pd.DataFrame,
+    wmap: Dict[str, float],
+    px_map: Dict[str, float],
+    scores_map: Dict[str, float],
+    sellable: Dict[str, int],
+    locked: Dict[str, int],
+    lot_size: int,
+    budget_nav: float,
+) -> List[Dict[str, Any]]:
+    """有持仓时，给出目标跟踪模式下的预估加仓行（可包含已持仓标的）。"""
+    if budget_nav <= 1e-9 or picks_df.empty:
+        return []
+    tradable_w = filter_target_weights_tradable(wmap, px_map)
+    if not tradable_w:
+        return []
+    desired = desired_shares_from_target_weights(
+        float(budget_nav),
+        tradable_w,
+        px_map,
+        int(lot_size),
+        scores_map,
+    )
+    current: Dict[str, int] = {}
+    for code in set(sellable) | set(locked):
+        tot = int(sellable.get(code, 0)) + int(locked.get(code, 0))
+        if tot > 0:
+            current[str(code)] = tot
+    pred_map = picks_df.set_index("ts_code")["pred_score"].astype(float).to_dict()
+    rows: List[Dict[str, Any]] = []
+    for code, tgt_shares in desired.items():
+        add_shares = int(tgt_shares) - int(current.get(code, 0))
+        if add_shares <= 0:
+            continue
+        rows.append(
+            {
+                "ts_code": str(code),
+                "pred_score": float(pred_map.get(code, scores_map.get(code, 0.0))),
+                "target_weight": float(tradable_w.get(code, 0.0)),
+                "target_amount": round(float(budget_nav) * float(tradable_w.get(code, 0.0)), 2),
+                "planned_add_shares": int(add_shares),
+            }
+        )
+    return sorted(rows, key=lambda x: (-x["pred_score"], x["ts_code"]))
+
+
+def constrain_tracking_weights_with_k_switch(
+    raw_weight_map: Dict[str, float],
+    sellable: Dict[str, int],
+    locked: Dict[str, int],
+    px_map: Dict[str, float],
+    scores_map: Dict[str, float],
+    n: int,
+    k: int,
+) -> Tuple[Dict[str, float], List[str], List[str]]:
+    """
+    在目标跟踪下施加“先卖最低分 k 只，再补齐到 n 只”约束：
+    - 允许持仓内部加减仓；
+    - 先从当前持仓中卖出最低分 k 只；
+    - 若卖后低于 n，只数可新增超过 k 以补齐到 n。
+    """
+    target_tradable = filter_target_weights_tradable(raw_weight_map, px_map)
+    held = {
+        str(c)
+        for c in (set(sellable) | set(locked))
+        if int(sellable.get(c, 0)) + int(locked.get(c, 0)) > 0
+    }
+    if not held:
+        return target_tradable, [], []
+
+    cap = max(0, int(k))
+    n_target = max(1, int(n))
+    exits = sorted(held, key=lambda c: (scores_map.get(c, -np.inf), c))[: min(cap, len(held))]
+    remaining = held - set(exits)
+    target_codes = set(target_tradable)
+    entry_candidates = sorted(
+        [c for c in target_codes if c not in remaining],
+        key=lambda c: (-scores_map.get(c, -np.inf), c),
+    )
+    slots_to_n = max(0, n_target - len(remaining))
+    entries = entry_candidates[:slots_to_n]
+    kept = remaining | set(entries)
+    if not kept:
+        kept = set(held)
+
+    # 在保留名称集合内按 pred_score 再分配。
+    finite_scores = [
+        float(scores_map.get(c))
+        for c in kept
+        if np.isfinite(float(scores_map.get(c, float("nan"))))
+    ]
+    smin = min(finite_scores) if finite_scores else 0.0
+    base: Dict[str, float] = {}
+    for code in kept:
+        s = float(scores_map.get(code, smin))
+        if not np.isfinite(s):
+            s = smin
+        base[code] = max(s - smin + 1e-12, 1e-18)
+
+    tot = sum(base.values())
+    if tot <= 1e-18:
+        return target_tradable, entries, exits
+    out = {c: float(v / tot) for c, v in base.items()}
+    return out, entries, exits
+
+
+def execute_target_tracking_at_open(
+    picks_df: pd.DataFrame,
+    px_map: Dict[str, float],
+    scores_map: Dict[str, float],
+    st: PortfolioState,
+    commission_rate: float,
+    *,
+    full_weight_map: Optional[Dict[str, float]] = None,
+    budget_nav: Optional[float] = None,
+    forced_keep_codes: Optional[Set[str]] = None,
+) -> Tuple[OrderLog, PortfolioState, float, float, str, List[Dict[str, Any]]]:
+    """按目标权重跟踪执行：先卖后买，允许对已持仓标的加减仓。"""
+    log = OrderLog()
+    wmap_raw = full_weight_map or score_weights_from_picks_df(picks_df)
+    wmap_tradable = filter_target_weights_tradable(wmap_raw, px_map)
+
+    sellable, locked = _unlock_locked_to_sellable(st.sellable, st.locked)
+    lot_size = int(st.lot_size)
+    cash = float(st.cash)
+    nav = float(
+        cash + _portfolio_mv_at_px(px_map, sellable, {})
+        if budget_nav is None
+        else max(float(budget_nav), 0.0)
+    )
+    full_amount_map = {c: nav * float(w) for c, w in wmap_raw.items()}
+
+    desired = desired_shares_from_target_weights(
+        nav,
+        wmap_tradable,
+        px_map,
+        lot_size,
+        scores_map,
+    )
+    current = {str(c): int(sh) for c, sh in sellable.items() if int(sh) > 0}
+    keep_set = {str(c) for c in (forced_keep_codes or set())}
+    for code in keep_set:
+        cur = int(current.get(code, 0))
+        px = float(px_map.get(code, float("nan")))
+        if cur >= lot_size and np.isfinite(px) and px > 0:
+            desired[code] = max(int(desired.get(code, 0)), lot_size)
+    order_rows: List[Dict[str, Any]] = []
+
+    # 先卖出：非目标仓位和超配仓位优先释放现金。
+    for code in sorted(current.keys(), key=lambda c: (scores_map.get(c, -np.inf), c)):
+        cur = int(current.get(code, 0))
+        tgt = int(desired.get(code, 0))
+        need_sell = max(0, cur - tgt)
+        qty = floor_to_lot(need_sell, lot_size)
+        qty = min(qty, floor_to_lot(cur, lot_size))
+        if qty <= 0:
+            continue
+        px = float(px_map.get(code, float("nan")))
+        if not np.isfinite(px) or px <= 0:
+            continue
+        proceeds = qty * px
+        sf = fees_on_sell_turnover(code, proceeds, qty, commission_rate)
+        cash += proceeds - sf
+        current[code] = cur - qty
+        if current[code] <= 0:
+            current.pop(code, None)
+            sellable.pop(code, None)
+        else:
+            sellable[code] = current[code]
+        order_rows.append(
+            {
+                "side": "卖出",
+                "ts_code": code,
+                "shares": int(qty),
+                "price": float(px),
+                "amount": float(proceeds),
+                "phase": "target-track-减仓/清仓",
+            }
+        )
+
+    # 再买入：按分数高到低补足目标仓位，受现金和费用约束。
+    for code in sorted(desired.keys(), key=lambda c: (-scores_map.get(c, -np.inf), c)):
+        tgt = int(desired.get(code, 0))
+        cur = int(current.get(code, 0))
+        need_buy = max(0, tgt - cur)
+        qty = floor_to_lot(need_buy, lot_size)
+        if qty <= 0:
+            continue
+        px = float(px_map.get(code, float("nan")))
+        if not np.isfinite(px) or px <= 0:
+            continue
+        while qty >= lot_size:
+            gross = qty * px
+            bf = fees_on_buy_turnover(code, gross, qty, commission_rate)
+            if gross + bf <= cash + 1e-6:
+                break
+            qty -= lot_size
+        if qty < lot_size:
+            continue
+        gross = qty * px
+        bf = fees_on_buy_turnover(code, gross, qty, commission_rate)
+        if gross + bf > cash + 1e-6:
+            continue
+        cash -= gross + bf
+        current[code] = cur + qty
+        locked[code] = int(locked.get(code, 0)) + int(qty)
+        order_rows.append(
+            {
+                "side": "买入",
+                "ts_code": code,
+                "shares": int(qty),
+                "price": float(px),
+                "amount": float(gross),
+                "phase": "target-track-加仓/建仓",
+            }
+        )
+
+    enriched = enrich_orders_with_targets(order_rows, wmap_raw, full_amount_map)
+    enriched = consolidate_orders_by_code(enriched)
+
+    fee_day = 0.0
+    for row in enriched:
+        amt = float(row["amount"])
+        sh = int(row["shares"])
+        code = str(row["ts_code"])
+        if row["side"] == "卖出":
+            fee_day += fees_on_sell_turnover(code, amt, sh, commission_rate)
+            log.sell(code, sh, float(row["price"]), str(row.get("phase", "")))
+        else:
+            fee_day += fees_on_buy_turnover(code, amt, sh, commission_rate)
+            log.buy(code, sh, float(row["price"]), str(row.get("phase", "")))
+
+    sellable_f = {c: int(sh) for c, sh in sellable.items() if sh > 0}
+    locked_f = {c: int(sh) for c, sh in locked.items() if sh > 0}
+    nav_after = float(cash) + _portfolio_mv_at_px(px_map, sellable_f, locked_f)
+    ps = PortfolioState(
+        cash=float(cash),
+        lot_size=lot_size,
+        sellable=sellable_f,
+        locked=locked_f,
+        commission_rate=commission_rate,
+    )
+    note = "execute-at-open：目标跟踪（先卖后买，按目标权重加减仓）"
+    return log, ps, fee_day, nav_after, note, enriched
 
 
 def enrich_orders_with_targets(
@@ -659,6 +920,12 @@ def main() -> None:
         help="execute / legacy：撮合价格列（默认 open）",
     )
     parser.add_argument(
+        "--rebalance-style",
+        choices=("target_tracking", "rotation"),
+        default="target_tracking",
+        help="execute / plan：调仓风格（默认 target_tracking）",
+    )
+    parser.add_argument(
         "--commission-rate",
         type=float,
         default=None,
@@ -697,24 +964,63 @@ def main() -> None:
         panel = scores[scores["trade_date"] == score_snap].drop_duplicates(subset=["ts_code"]).copy()
         panel = panel.sort_values("pred_score", ascending=False).reset_index(drop=True)
         picks_df, wmap = build_target_weights_plan(panel, args.n, args.k)
-        budget_cash = 0.0
+        scores_full_map = panel.set_index("ts_code")["pred_score"].astype(float).to_dict()
+        budget_nav = 0.0
         sellable: Dict[str, int] = {}
         locked: Dict[str, int] = {}
+        lot_size_plan = 100
+        px_plan: Dict[str, float] = {}
+        entries_k: List[str] = []
+        exits_k: List[str] = []
         if args.state:
             st_plan = load_portfolio_json(args.state)
-            budget_cash = float(st_plan.cash)
+            lot_size_plan = int(st_plan.lot_size)
             sellable = dict(st_plan.sellable)
             locked = dict(st_plan.locked)
+            try:
+                px_plan = load_trade_price_map_for_day(args.data_root, score_snap, price_col="close")
+                budget_nav = float(st_plan.cash) + _portfolio_mv_at_px(px_plan, sellable, locked)
+                if (
+                    args.rebalance_style == "target_tracking"
+                    and portfolio_has_holdings(sellable, locked)
+                ):
+                    wmap, entries_k, exits_k = constrain_tracking_weights_with_k_switch(
+                        wmap,
+                        sellable,
+                        locked,
+                        px_plan,
+                        scores_full_map,
+                        args.n,
+                        args.k,
+                    )
+            except FileNotFoundError:
+                budget_nav = float(st_plan.cash)
+                print(
+                    f"[警告] 无法读取 {score_snap} close 行情，budget_nav 回退为现金口径：{budget_nav:.2f}",
+                    file=sys.stderr,
+                )
 
-        target_rows = build_target_weight_rows(picks_df, wmap, budget_cash)
-        planned_buys = planned_buy_rows_for_rotation(
-            picks_df,
-            panel.set_index("ts_code")["pred_score"].astype(float).to_dict(),
+        target_codes = set(wmap.keys())
+        picks_plan_df = panel[panel["ts_code"].astype(str).isin(target_codes)].copy()
+        if picks_plan_df.empty and target_codes:
+            picks_plan_df = pd.DataFrame(
+                {
+                    "ts_code": list(target_codes),
+                    "pred_score": [float(scores_full_map.get(c, 0.0)) for c in target_codes],
+                }
+            )
+        picks_plan_df = picks_plan_df.sort_values("pred_score", ascending=False).reset_index(drop=True)
+
+        target_rows = build_target_weight_rows(picks_plan_df, wmap, budget_nav)
+        planned_buys = planned_buy_rows_for_target_tracking(
+            picks_plan_df,
+            wmap,
+            px_plan,
+            scores_full_map,
             sellable,
             locked,
-            args.n,
-            args.k,
-            budget_cash,
+            lot_size_plan,
+            budget_nav,
         )
         top_df = pd.DataFrame(target_rows)
 
@@ -722,13 +1028,18 @@ def main() -> None:
         print(f"下一交易日: {next_d}")
         print(f"打分快照 trade_date = {score_snap}")
         print(f"说明: {snap_note}")
-        print(f"预算现金 budget_cash = {budget_cash:.2f} 元")
-        print(f"目标持仓 Top-{args.n}；有仓时日换 {args.k} 只；权重 ∝ pred_score（Top-n 内归一）")
+        print(f"预算总资产 budget_nav = {budget_nav:.2f} 元（现金+持仓市值）")
+        print(f"目标持仓 Top-{args.n}；调仓风格={args.rebalance_style}；权重 ∝ pred_score（Top-n 内归一）")
+        if entries_k or exits_k:
+            print(
+                f"换仓名称约束：先卖最低分 {args.k} 只；本次计划 新进={len(entries_k)} 只、退出={len(exits_k)} 只"
+            )
         print("\n--- 目标持仓（权重 / 参考金额）---")
         print(top_df[["ts_code", "pred_score", "target_weight", "target_amount"]].to_string(index=False))
         if planned_buys:
-            print(f"\n--- 预估买入 Top-{args.k}（按 rotate-k，参考金额=预算现金×买入权重）---")
-            print(pd.DataFrame(planned_buys)[["ts_code", "pred_score", "target_weight", "target_amount"]].to_string(index=False))
+            print("\n--- 预估加仓/建仓（目标跟踪，按目标缺口）---")
+            cols_plan_buy = ["ts_code", "pred_score", "target_weight", "target_amount", "planned_add_shares"]
+            print(pd.DataFrame(planned_buys)[cols_plan_buy].to_string(index=False))
         print("\n提示：target_amount 为参考金额；execute 阶段按 open 价换算整手股数。")
 
         plan_payload = {
@@ -739,13 +1050,20 @@ def main() -> None:
             "score_lag": int(args.score_lag),
             "hold_n": int(args.n),
             "rotate_k": int(args.k),
-            "budget_cash": round(budget_cash, 2),
+            "rebalance_style": str(args.rebalance_style),
+            "switch_cap_k": int(args.k),
+            "planned_entries": entries_k,
+            "planned_exits": exits_k,
+            "budget_basis": "nav",
+            "budget_nav": round(budget_nav, 2),
+            "budget_cash": round(budget_nav, 2),
             "target_weights": target_rows,
             "planned_buys": planned_buys,
             "artifacts": {"scores_csv": args.scores},
             "notes": (
-                "target_weights：Top-n 目标权重与参考购买金额（target_amount=budget_cash×target_weight）。"
-                "planned_buys：有持仓时按 rotate-k 预估的次日买入标的及参考金额。"
+                "target_weights：Top-n 目标权重与参考购买金额（target_amount=budget_nav×target_weight，budget_nav=现金+持仓市值）。"
+                f"在 target_tracking 下先卖持仓最低分 {int(args.k)} 只；若卖后不足 n，则允许新增超过 k 只以补齐到 n。"
+                "planned_buys：目标跟踪下按目标缺口预估的加仓/建仓标的。"
                 "execute-next 在 open 价下生成实际 orders（含 target_weight / target_amount / amount）。"
             ),
         }
@@ -826,13 +1144,33 @@ def main() -> None:
         else:
             crate = float(st.commission_rate)
 
-        log, ps_end, fee, nav_after, sim_note, enriched_orders = execute_rotation_at_open(
-            picks_df, px_map, scores_map, st, hold_n, rotate_k, crate
-        )
+        rebalance_style = str(plan_raw.get("rebalance_style", args.rebalance_style))
+        budget_nav = plan_raw.get("budget_nav", plan_raw.get("budget_cash"))
+        budget_nav_f = float(budget_nav) if budget_nav is not None else None
+        planned_exits = {str(c) for c in (plan_raw.get("planned_exits") or [])}
+        current_codes = {str(c) for c, sh in st.sellable.items() if int(sh) > 0} | {
+            str(c) for c, sh in st.locked.items() if int(sh) > 0
+        }
+        forced_keep_codes = current_codes - planned_exits
+        if rebalance_style == "rotation":
+            log, ps_end, fee, nav_after, sim_note, enriched_orders = execute_rotation_at_open(
+                picks_df, px_map, scores_map, st, hold_n, rotate_k, crate, budget_cash=budget_nav_f
+            )
+        else:
+            log, ps_end, fee, nav_after, sim_note, enriched_orders = execute_target_tracking_at_open(
+                picks_df,
+                px_map,
+                scores_map,
+                st,
+                crate,
+                full_weight_map=target_weights,
+                budget_nav=budget_nav_f,
+                forced_keep_codes=forced_keep_codes,
+            )
 
-        print("=== execute-at-open：Top-n 持仓 + 日度换 k ===")
+        print("=== execute-at-open：目标权重执行 ===")
         print(f"执行交易日: {next_d}  |  成交价 CSV 日: {px_date}  |  价格列: {price_col_used}")
-        print(f"hold_n={hold_n}  rotate_k={rotate_k}")
+        print(f"rebalance_style={rebalance_style}  hold_n={hold_n}  rotate_k={rotate_k}")
         print(f"推演说明: {sim_note}")
         print(f"交易费用估算合计 ≈ {fee:.2f} 元；推演净值 ≈ {nav_after:.2f} 元；现金 ≈ {ps_end.cash:.2f} 元")
         print("\n--- 指令明细（含目标权重 / 目标金额 / 实际金额）---")

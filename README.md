@@ -37,17 +37,19 @@ export DL_DATA_ROOT=/path/to/fundamentals_for_deep_learning/data
 
 - **`n`（`--n-pool`）**：同一时段目标持有股票只数，取 pred_score 最高的 Top-n（默认 20）。
 - **`k`（`--k-hold`）**：有持仓时的日度换仓只数（默认 4）。
-- 目标 Top-n 内，参考权重与 `pred_score` 成正比（平移后归一化），写入 plan 的 `target_weight`；参考购买金额 `target_amount = budget_cash × target_weight`（`budget_cash` 取自账户 JSON 的现金余额）。
+- 目标 Top-n 内，参考权重与 `pred_score` 成正比（平移后归一化），写入 plan 的 `target_weight`；参考购买金额 `target_amount = budget_nav × target_weight`，其中 `budget_nav = 现金 + 持仓市值`（按打分快照日 close 估算）。
 
 ### 调仓规则
 
 1. **空仓（如 `state_empty.json`）**：首次建仓一次性买入 Top-n，`k` 不参与。
-2. **有持仓**：每个交易日
-   - **强制卖出**已跌出 Top-n 的持仓；
-   - 在剩余持仓中卖出 **分数最低的 k 只**（可卖整手）；
-   - 从 Top-n 中 **尚未持有** 的标的里按分数从高到低买入，**买入只数 = 本轮成功卖出只数**（不超过 `n − 当前持仓只数`）；
-   - 新买入资金按 pred_score 加权分配。
-3. 组合目标规模维持 **≤ n 只**；正常日度最多换 **k 只**（跌出 Top-n 的 trim 不计入 k）。
+2. **有持仓（`predict-next` / `execute-next`）**：采用 `target_tracking` 目标跟踪
+   - 先按目标权重计算目标股数（整手约束）；
+   - **先卖持仓最低分 `k` 只**（默认 4）；
+   - 卖后若持仓只数低于 `n`，允许新增超过 `k` 的名称数来补齐到 `n`；
+   - **先卖后买**：先减仓/清仓超配仓位与非目标仓位，再用现金 + 卖出回笼资金补足低配仓位；
+   - 允许对**已有持仓**做加仓/减仓（名称不变时的内部再分配按 `pred_score` 进行）；
+   - 全程应用费用模型与可交易价格过滤。
+3. `backtest.py` 仍保留 rotate-k 回测口径；实盘两阶段（plan/execute）默认走 `target_tracking`。
 
 ### 训练与回测的关系（重要）
 
@@ -216,9 +218,12 @@ python workbench.py predict-next \
 
 输出文件 `final_plan.json` 主要字段：
 
-- `budget_cash`：参考预算现金（来自 `--state-in`）
+- `budget_nav`：参考预算总资产（`现金 + 持仓市值`）
+- `rebalance_style`：调仓风格（默认 `target_tracking`）
+- `switch_cap_k`：每次先卖出的最低分持仓只数（与 `--k-hold` 对齐）
+- `planned_entries` / `planned_exits`：计划层面的新进/退出名称
 - `target_weights`：Top-n 目标持仓，每行含 `ts_code`、`pred_score`、`target_weight`、`target_amount`
-- `planned_buys`：有持仓时按 rotate-k 预估的次日买入标的（含权重与参考金额；空仓为空数组）
+- `planned_buys`：有持仓时按目标缺口预估的加仓/建仓标的（含参考金额）
 
 不含买卖股数。参数 `--trade-price-col` 与 `--commission-rate` 写入 plan，供执行阶段引用。
 
@@ -264,7 +269,7 @@ python workbench.py execute-next \
 | `outputs/wf_metrics.json` | 训练验证指标 |
 | `outputs/wf_daily_ic.csv` | 逐日截面 IC |
 | `outputs/feature_report.json` | 特征筛选报告 |
-| `outputs/final_plan.json` | 目标权重 plan（含 `target_amount` / `planned_buys`） |
+| `outputs/final_plan.json` | 目标权重 plan（含 `budget_nav` / `target_amount` / `planned_buys`） |
 | `outputs/final_ops.json` | 执行指令（含 `target_weight` / `target_amount` / `amount`）与收盘后账户状态 |
 
 ---
