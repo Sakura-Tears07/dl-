@@ -686,7 +686,7 @@ def main() -> None:
         help="可选：写出按日 Pearson/Rank IC 的 CSV；留空则不写",
     )
     pb.add_argument("--launcher", choices=("python", "torchrun"), default="python")
-    pb.add_argument("--nproc", type=int, default=1, help="torchrun 时每机进程数（GPU 数）")
+    pb.add_argument("--nproc", type=int, default=4, help="torchrun 时每机进程数（GPU 数）")
     pb.add_argument(
         "train_argv",
         nargs=argparse.REMAINDER,
@@ -739,7 +739,7 @@ def main() -> None:
         help="兼容旧参数：基点制（万三=3），若提供则覆盖 --commission-rate",
     )
     pn.add_argument("--launcher", choices=("python", "torchrun"), default="python")
-    pn.add_argument("--nproc", type=int, default=1)
+    pn.add_argument("--nproc", type=int, default=4)
     pn.add_argument(
         "train_argv",
         nargs=argparse.REMAINDER,
